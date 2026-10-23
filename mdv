@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+"""mdv - display Markdown files nicely in the terminal.
+
+Usage: mdv [options] [FILE ...]      (no file or "-" reads stdin)
+
+Standard library only. If Pygments is installed, fenced code blocks are
+syntax highlighted. Honours NO_COLOR. Pages long output through `less -R`.
+"""
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import unicodedata
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+T = {}  # theme, filled by build_theme()
+R = ""  # reset sequence ("" when colour is off)
+
+
+def sgr(*codes):
+    return "\x1b[" + ";".join(codes) + "m"
+
+
+def build_theme(color):
+    global T, R
+    theme = {
+        "h1": sgr("1", "38;5;213"),
+        "h2": sgr("1", "38;5;81"),
+        "h3": sgr("1", "38;5;221"),
+        "h4": sgr("1", "38;5;150"),
+        "h5": sgr("1"),
+        "h6": sgr("1", "2"),
+        "bold": sgr("1"),
+        "italic": sgr("3"),
+        "strike": sgr("9", "2"),
+        "dim": sgr("2"),
+        "code": sgr("38;5;216", "48;5;236"),
+        "block_fg": sgr("38;5;252"),
+        "link": sgr("4", "38;5;75"),
+        "url": sgr("2"),
+        "rule": sgr("38;5;240"),
+        "bar": sgr("38;5;244"),
+        "bullet": sgr("38;5;213"),
+        "table": sgr("38;5;240"),
+        "th": sgr("1", "38;5;81"),
+        "check": sgr("38;5;114"),
+        "uncheck": sgr("38;5;244"),
+        "NOTE": sgr("1", "38;5;75"),
+        "TIP": sgr("1", "38;5;114"),
+        "IMPORTANT": sgr("1", "38;5;141"),
+        "WARNING": sgr("1", "38;5;221"),
+        "CAUTION": sgr("1", "38;5;203"),
+    }
+    T = theme if color else {k: "" for k in theme}
+    R = sgr("0") if color else ""
+
+
+# ---------------------------------------------------------------- text width
+
+
+def vwidth(s):
+    """Visible width of a string: ignores ANSI codes, counts wide chars as 2."""
+    w = 0
+    for ch in ANSI_RE.sub("", s):
+        if unicodedata.combining(ch) or ch in "‍️":
+            continue
+        w += 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+    return w
+
+
+def chunks(tok, width):
+    """Hard-split a word that is wider than the line."""
+    out, cur, cw = [], "", 0
+    for part in re.findall(r"\x1b\[[0-9;]*m|.", tok, re.S):
+        pw = 0 if part.startswith("\x1b") else vwidth(part)
+        if cw and cw + pw > width:
+            out.append(cur)
+            cur, cw = "", 0
+        cur += part
+        cw += pw
+    out.append(cur)
+    return out
+
+
+def wrap(text, width):
+    """Greedy word wrap that ignores ANSI codes and carries styles across lines."""
+    width = max(width, 1)
+    out, active = [], ""
+    for para in text.split("\n"):
+        cur, cur_w = active, 0
+        for tok in re.findall(r"[ \t]+|[^ \t]+", para):
+            if tok[0] in " \t":
+                if cur_w:
+                    cur += " "
+                    cur_w += 1
+                continue
+            w = vwidth(tok)
+            for piece in chunks(tok, width) if w > width else [tok]:
+                pw = vwidth(piece)
+                if cur_w and cur_w + pw > width:
+                    out.append(cur.rstrip(" ") + (R if active else ""))
+                    cur, cur_w = active, 0
+                cur += piece
+                cur_w += pw
+                for code in ANSI_RE.findall(piece):
+                    active = "" if code == R else active + code
+        out.append(cur.rstrip(" ") + (R if active else ""))
+    return out
+
+
+def pad(s, w, align):
+    extra = max(w - vwidth(s), 0)
+    if align == "r":
+        return " " * extra + s
+    if align == "c":
+        return " " * (extra // 2) + s + " " * (extra - extra // 2)
+    return s + " " * extra
+
+
+# -------------------------------------------------------------------- inline
+
+INLINE_RE = re.compile(
+    r"(?P<tick>`+)(?P<code>.+?)(?P=tick)"
+    r"|!\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]*)[^)]*\)"
+    r"|\[(?P<ltext>[^\]]+)\]\((?P<url>[^)\s]*)[^)]*\)"
+    r"|<(?P<auto>(?:https?|mailto):[^>\s]+)>"
+    r"|(?P<bm>\*\*|__)(?P<bold>.+?)(?P=bm)"
+    r"|~~(?P<strike>.+?)~~"
+    r"|(?<![\w*])\*(?P<em>[^*\s](?:.*?[^*\s])?)\*(?!\*)"
+    r"|(?<![\w])_(?P<em2>[^_\s](?:.*?[^_\s])?)_(?![\w])"
+    r"|\\(?P<esc>[\\`*_{}\[\]()#+\-.!|>~<])"
+)
+TAG_RE = re.compile(
+    r"</?(?:kbd|sub|sup|b|i|em|strong|span|div|p|u|small|details|summary|img|a|"
+    r"code|picture|source|center|h[1-6])\b[^>]*>",
+    re.I,
+)
+
+
+def inline(text, base=""):
+    """Render inline Markdown; `base` is the style to restore after each span."""
+    out, pos = [], 0
+
+    def span(style, inner):
+        return style + inline(inner, base + style) + R + base
+
+    for m in INLINE_RE.finditer(text):
+        out.append(TAG_RE.sub("", text[pos : m.start()]))
+        pos = m.end()
+        g = m.group
+        if g("tick"):
+            out.append(T["code"] + g("code").strip() + R + base)
+        elif g("src") is not None:
+            out.append(T["dim"] + "[image" + (": " + g("alt") if g("alt") else "") + "]" + R + base)
+        elif g("ltext"):
+            out.append(span(T["link"], g("ltext")))
+            url = g("url")
+            if url and url != g("ltext") and not url.startswith("#"):
+                out.append(" " + T["url"] + "(" + url + ")" + R + base)
+        elif g("auto"):
+            out.append(T["link"] + g("auto") + R + base)
+        elif g("bold"):
+            out.append(span(T["bold"], g("bold")))
+        elif g("strike"):
+            out.append(span(T["strike"], g("strike")))
+        elif g("em") or g("em2"):
+            out.append(span(T["italic"], g("em") or g("em2")))
+        elif g("esc"):
+            out.append(g("esc"))
+    out.append(TAG_RE.sub("", text[pos:]))
+    return "".join(out)
+
+
+# -------------------------------------------------------------------- blocks
+
+FENCE_RE = re.compile(r"^(\s*)(`{3,}|~{3,})\s*([^`\s{]*)")
+HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+)?\s*$")
+HR_RE = re.compile(r"^\s{0,3}([-*_])(\s*\1){2,}\s*$")
+LIST_RE = re.compile(r"^(\s*)([-*+]|\d{1,9}[.)])(\s+|$)(.*)$")
+QUOTE_RE = re.compile(r"^\s{0,3}>\s?(.*)$")
+TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
+SETEXT_RE = re.compile(r"^\s{0,3}(=+|-+)\s*$")
+ALERT_RE = re.compile(r"^\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*$", re.I)
+BULLETS = "•◦▪▫"
+
+
+def indent_of(line):
+    return len(line) - len(line.lstrip(" "))
+
+
+def is_table(lines, i):
+    return i + 1 < len(lines) and "|" in lines[i] and "|" in lines[i + 1] and bool(TABLE_SEP_RE.match(lines[i + 1]))
+
+
+def starts_block(lines, i):
+    line = lines[i]
+    return bool(
+        FENCE_RE.match(line)
+        or HEADING_RE.match(line)
+        or HR_RE.match(line)
+        or QUOTE_RE.match(line)
+        or LIST_RE.match(line)
+        or is_table(lines, i)
+    )
+
+
+def highlight(code, lang):
+    if T["bold"] and lang:
+        try:
+            from pygments import highlight as pyg_highlight
+            from pygments.formatters import Terminal256Formatter
+            from pygments.lexers import get_lexer_by_name
+
+            res = pyg_highlight(code, get_lexer_by_name(lang), Terminal256Formatter(style="monokai"))
+            return res.rstrip("\n").split("\n")
+        except Exception:
+            pass
+    return [T["block_fg"] + line + R for line in code.split("\n")]
+
+
+def code_block(body, lang, width):
+    while body and not body[-1].strip():
+        body.pop()
+    b = T["rule"]
+    head = "╭─ " + lang + " " if lang else "╭"
+    out = [b + head + "─" * max(width - vwidth(head), 0) + R]
+    out += [b + "│ " + R + line + R for line in highlight("\n".join(body), lang)]
+    out.append(b + "╰" + "─" * (width - 1) + R)
+    return out
+
+
+def heading(level, text, width):
+    st = T["h%d" % level]
+    prefix = {3: "◆ ", 4: "◇ "}.get(level, "")
+    lines = wrap(st + prefix + inline(text, st) + R, width)
+    if level == 1:
+        lines.append(T["h1"] + "━" * width + R)
+    elif level == 2:
+        lines.append(T["rule"] + "─" * min(width, max(vwidth(l) for l in lines)) + R)
+    return lines
+
+
+def blockquote(body, width, depth):
+    color, header = T["bar"], None
+    if body and (a := ALERT_RE.match(body[0])):
+        kind = a.group(1).upper()
+        color, header = T[kind], T[kind] + kind.title() + R
+        body = body[1:]
+    inner = render(body, max(width - 2, 10), depth)
+    if header:
+        inner = [header] + inner
+    return [color + "│" + R + (" " + line if line else "") for line in inner]
+
+
+def table(rows, width):
+    header = split_row(rows[0])
+    ncol = len(header)
+    aligns = []
+    for c in split_row(rows[1])[:ncol]:
+        aligns.append("c" if c.startswith(":") and c.endswith(":") else "r" if c.endswith(":") else "l")
+    aligns += ["l"] * (ncol - len(aligns))
+    head = [T["th"] + inline(c, T["th"]) + R for c in header]
+    body = [[inline(c) for c in (split_row(r) + [""] * ncol)[:ncol]] for r in rows[2:]]
+
+    widths = [max([vwidth(head[j])] + [vwidth(r[j]) for r in body] + [1]) for j in range(ncol)]
+    avail = width - 3 * ncol - 1
+    while sum(widths) > avail:
+        j = widths.index(max(widths))
+        if widths[j] <= 3:
+            break
+        widths[j] -= 1
+
+    b = T["table"]
+    sep = b + "│" + R
+
+    def border(left, mid, right):
+        return b + left + mid.join("─" * (w + 2) for w in widths) + right + R
+
+    def row(cells):
+        wrapped = [wrap(c, widths[j]) for j, c in enumerate(cells)]
+        lines = []
+        for k in range(max(len(w) for w in wrapped)):
+            parts = [pad(w[k] if k < len(w) else "", widths[j], aligns[j]) for j, w in enumerate(wrapped)]
+            lines.append(sep + sep.join(" " + p + " " for p in parts) + sep)
+        return lines
+
+    out = [border("┌", "┬", "┐")] + row(head) + [border("├", "┼", "┤")]
+    for r in body:
+        out += row(r)
+    out.append(border("└", "┴", "┘"))
+    return out
+
+
+def split_row(line):
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|") and not s.endswith("\\|"):
+        s = s[:-1]
+    return [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", s)]
+
+
+def list_block(lines, i, width, depth):
+    n = len(lines)
+    first = LIST_RE.match(lines[i])
+    base = len(first.group(1))
+    ordered = first.group(2)[0].isdigit()
+    start = int(first.group(2)[:-1]) if ordered else 0
+    items, loose = [], False
+
+    while i < n:
+        m = LIST_RE.match(lines[i])
+        if not m or len(m.group(1)) != base or m.group(2)[0].isdigit() != ordered or HR_RE.match(lines[i]):
+            break
+        content_col = len(m.group(1)) + len(m.group(2)) + len(m.group(3))
+        body = [m.group(4)]
+        i += 1
+        while i < n:
+            line = lines[i]
+            if not line.strip():
+                k = i
+                while k < n and not lines[k].strip():
+                    k += 1
+                if k < n and indent_of(lines[k]) > base:
+                    body += [""] * (k - i)
+                    i, loose = k, True
+                    continue
+                break
+            ind = indent_of(line)
+            if ind > base:
+                body.append(line[min(ind, content_col) :])
+            elif starts_block(lines, i):
+                break
+            else:
+                body.append(line.strip())  # lazy continuation
+            i += 1
+        items.append(body)
+        k = i
+        while k < n and not lines[k].strip():
+            k += 1
+        s = LIST_RE.match(lines[k]) if k < n else None
+        if k > i and s and len(s.group(1)) == base and s.group(2)[0].isdigit() == ordered and not HR_RE.match(lines[k]):
+            i, loose = k, True
+
+    lw = (len(str(start + len(items) - 1)) + 2) if ordered else 2
+    out = []
+    for k, body in enumerate(items):
+        task = re.match(r"^\[([ xX])\]\s+(.*)$", body[0])
+        if task:
+            label = T["check"] + "✔" + R if task.group(1) != " " else T["uncheck"] + "☐" + R
+            body[0] = task.group(2)
+        elif ordered:
+            label = T["bullet"] + ("%d." % (start + k)).rjust(lw - 1) + R
+        else:
+            label = T["bullet"] + BULLETS[depth % len(BULLETS)] + R
+        label += " " * (lw - vwidth(label))
+        rendered = render(body, max(width - lw, 10), depth + 1)
+        if not loose:
+            rendered = [line for line in rendered if line]
+        rendered = rendered or [""]
+        out.append(label + rendered[0])
+        out += [" " * lw + line if line else "" for line in rendered[1:]]
+        if loose and k < len(items) - 1:
+            out.append("")
+    return out, i
+
+
+def render(lines, width, depth=0):
+    out = []
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if not line.strip():
+            i += 1
+            continue
+
+        if m := FENCE_RE.match(line):
+            ind, fence, lang = len(m.group(1)), m.group(2), m.group(3)
+            close = re.compile(r"^\s*%s{%d,}\s*$" % (re.escape(fence[0]), len(fence)))
+            body, i = [], i + 1
+            while i < n and not close.match(lines[i]):
+                body.append(lines[i][min(ind, indent_of(lines[i])) :])
+                i += 1
+            i += 1
+            out += code_block(body, lang, width)
+        elif m := HEADING_RE.match(line):
+            out += heading(len(m.group(1)), m.group(2), width)
+            i += 1
+        elif HR_RE.match(line):
+            out.append(T["rule"] + "─" * width + R)
+            i += 1
+        elif QUOTE_RE.match(line):
+            body = []
+            while i < n and lines[i].strip():
+                if q := QUOTE_RE.match(lines[i]):
+                    body.append(q.group(1))
+                elif starts_block(lines, i):
+                    break
+                else:
+                    body.append(lines[i])
+                i += 1
+            out += blockquote(body, width, depth)
+        elif LIST_RE.match(line):
+            block, i = list_block(lines, i, width, depth)
+            out += block
+        elif is_table(lines, i):
+            rows = [lines[i], lines[i + 1]]
+            i += 2
+            while i < n and lines[i].strip() and "|" in lines[i]:
+                rows.append(lines[i])
+                i += 1
+            out += table(rows, width)
+        elif line.startswith("    "):
+            body = []
+            while i < n and (lines[i].startswith("    ") or not lines[i].strip()):
+                body.append(lines[i][4:])
+                i += 1
+            out += code_block(body, "", width)
+        else:
+            para, level = [line], 0
+            i += 1
+            while i < n and lines[i].strip():
+                if s := SETEXT_RE.match(lines[i]):
+                    level = 1 if s.group(1)[0] == "=" else 2
+                    i += 1
+                    break
+                if starts_block(lines, i):
+                    break
+                para.append(lines[i])
+                i += 1
+            text = ""
+            for k, p in enumerate(para):
+                hard = p.endswith("  ") or p.rstrip().endswith("\\")
+                s = p.strip()
+                s = s[:-1] if s.endswith("\\") else s
+                text += s + ("\n" if hard and k < len(para) - 1 else " ")
+            text = re.sub(r"<br\s*/?>", "\n", text.strip(), flags=re.I)
+            if level:
+                out += heading(level, text, width)
+            else:
+                out += wrap(inline(text), width)
+        out.append("")
+
+    # collapse repeated blank lines
+    clean = []
+    for line in out:
+        if line or (clean and clean[-1]):
+            clean.append(line)
+    while clean and not clean[-1]:
+        clean.pop()
+    return clean
+
+
+def render_document(text, width):
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    lines = text.expandtabs(4).splitlines()
+    out = []
+    if lines and lines[0].strip() == "---":  # YAML front matter
+        for k in range(1, len(lines)):
+            if lines[k].strip() in ("---", "..."):
+                out += code_block(lines[1:k], "yaml", width) + [""]
+                lines = lines[k + 1 :]
+                break
+    return out + render(lines, width)
+
+
+# ---------------------------------------------------------------------- main
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="mdv", description="Display Markdown nicely in the terminal.")
+    ap.add_argument("files", nargs="*", help="Markdown files (none or '-' reads stdin)")
+    ap.add_argument("-w", "--width", type=int, help="wrap width (default: terminal width, max 100)")
+    ap.add_argument("-P", "--no-pager", action="store_true", help="never page output through less")
+    ap.add_argument("--color", choices=["auto", "always", "never"], default="auto")
+    args = ap.parse_args()
+
+    tty = sys.stdout.isatty()
+    if args.color == "auto":
+        color = tty and not os.environ.get("NO_COLOR")
+    else:
+        color = args.color == "always"
+    build_theme(color)
+
+    cols, rows = shutil.get_terminal_size((80, 24))
+    width = args.width or min(cols, 100)
+
+    out = []
+    files = args.files or ["-"]
+    for idx, path in enumerate(files):
+        try:
+            if path == "-":
+                text = sys.stdin.read()
+            else:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+        except OSError as e:
+            print("mdv: %s: %s" % (path, e.strerror), file=sys.stderr)
+            return 1
+        if len(files) > 1:
+            if idx:
+                out += ["", ""]
+            out += [T["dim"] + "── " + path + " " + "─" * max(width - len(path) - 4, 0) + R, ""]
+        out += render_document(text, width)
+
+    doc = "\n".join(out) + "\n"
+    if tty and not args.no_pager and len(out) >= rows:
+        try:
+            env = dict(os.environ, LESSCHARSET="utf-8")
+            pager = subprocess.Popen(["less", "-R"], stdin=subprocess.PIPE, env=env)
+            try:
+                pager.communicate(doc.encode("utf-8"))
+            except (BrokenPipeError, KeyboardInterrupt):
+                pass
+            return 0
+        except OSError:
+            pass
+    try:
+        sys.stdout.write(doc)
+    except BrokenPipeError:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
