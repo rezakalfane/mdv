@@ -4,7 +4,7 @@
 Usage: mdv [options] [FILE ...]      (no file or "-" reads stdin)
 
 Standard library only. If Pygments is installed, fenced code blocks are
-syntax highlighted. Honours NO_COLOR. Pages long output through `less -R`.
+syntax highlighted. Honours NO_COLOR. Long output opens in a built-in pager that re-wraps on resize.
 """
 import argparse
 import os
@@ -13,48 +13,177 @@ import shutil
 import subprocess
 import sys
 import unicodedata
+import urllib.parse
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 T = {}  # theme, filled by build_theme()
 R = ""  # reset sequence ("" when colour is off)
+
+# Links are tagged in the rendered text with invisible private-use characters
+# (one start and one end mark per link id) so the pager can find, highlight and
+# follow them after wrapping. They are removed before anything is printed.
+LINK_START, LINK_END = 0xF0000, 0xF8000
+MARK_RE = re.compile("[\U000F0000-\U0010FFFD]")
+
+# Selection zones use the same trick: a zone mark says which region the
+# following characters belong to, until the next zone mark or the end of the
+# line. Decoration (borders, padding, bullets, line numbers) is never copied;
+# each code block and each table column is its own zone.
+ZONE_BASE = 0x100000
+BODY, DECO = 0, 1
+SKIP = 0xFFFC  # zone value meaning "only the next character is decoration"
+SOFT_SPACE, SOFT_JOIN = 0xFFFB, 0xFFFA  # end of a wrapped line: rejoin with a space / with nothing
+FLAGS = (SKIP, SOFT_SPACE, SOFT_JOIN)
+CTX = {"base": ".", "links": [], "zones": DECO}  # base dir, links and zone counter of the current render
+
+
+def zmark(zone):
+    return chr(ZONE_BASE + zone)
+
+
+def deco(text):
+    """Decoration inside body text: not copied by a selection."""
+    return zmark(DECO) + text + zmark(BODY) if text else text
+
+
+def new_zone():
+    if CTX["zones"] + 1 >= 0xFFF0:
+        return BODY
+    CTX["zones"] += 1
+    return CTX["zones"]
 
 
 def sgr(*codes):
     return "\x1b[" + ";".join(codes) + "m"
 
 
-def build_theme(color):
-    global T, R
-    theme = {
-        "h1": sgr("1", "38;5;213"),
-        "h2": sgr("1", "38;5;81"),
-        "h3": sgr("1", "38;5;221"),
-        "h4": sgr("1", "38;5;150"),
-        "h5": sgr("1"),
-        "h6": sgr("1", "2"),
-        "bold": sgr("1"),
-        "italic": sgr("3"),
-        "strike": sgr("9", "2"),
-        "dim": sgr("2"),
-        "code": sgr("38;5;216", "48;5;236"),
-        "block_fg": sgr("38;5;252"),
-        "link": sgr("4", "38;5;75"),
-        "url": sgr("2"),
-        "rule": sgr("38;5;240"),
-        "bar": sgr("38;5;244"),
-        "bullet": sgr("38;5;213"),
-        "table": sgr("38;5;240"),
-        "th": sgr("1", "38;5;81"),
-        "check": sgr("38;5;114"),
-        "uncheck": sgr("38;5;244"),
-        "NOTE": sgr("1", "38;5;75"),
-        "TIP": sgr("1", "38;5;114"),
-        "IMPORTANT": sgr("1", "38;5;141"),
-        "WARNING": sgr("1", "38;5;221"),
-        "CAUTION": sgr("1", "38;5;203"),
+PYGMENTS_STYLE = None  # code highlighting style of the active theme
+
+# Themes use the 256-colour palette (works in every common terminal, including
+# macOS Terminal). Values are SGR parameters. Code blocks and inline code sit on
+# their own dark grey panel, so code reads the same on any terminal background.
+# "for" tells which terminal background the theme is designed for.
+THEMES = {
+    "midnight": {
+        "for": "dark", "pygments": "monokai",
+        "h1": "1;38;5;213", "h2": "1;38;5;81", "h3": "1;38;5;221", "h4": "1;38;5;150",
+        "accent": "38;5;213", "link": "4;38;5;75", "muted": "38;5;246", "line": "38;5;242",
+        "code": "38;5;216;48;5;238", "panel": "48;5;236", "label": "1;38;5;117",
+        "ok": "38;5;114", "NOTE": "1;38;5;75", "TIP": "1;38;5;114", "IMPORTANT": "1;38;5;141",
+        "WARNING": "1;38;5;221", "CAUTION": "1;38;5;203",
+    },
+    "paper": {
+        "for": "light", "pygments": "one-dark",
+        "h1": "1;38;5;162", "h2": "1;38;5;25", "h3": "1;38;5;130", "h4": "1;38;5;28",
+        "accent": "38;5;162", "link": "4;38;5;26", "muted": "38;5;242", "line": "38;5;246",
+        "code": "38;5;223;48;5;239", "panel": "48;5;238", "label": "1;38;5;25",
+        "ok": "38;5;28", "NOTE": "1;38;5;25", "TIP": "1;38;5;28", "IMPORTANT": "1;38;5;91",
+        "WARNING": "1;38;5;130", "CAUTION": "1;38;5;160",
+    },
+    "nord": {
+        "for": "dark", "pygments": "nord",
+        "h1": "1;38;5;110", "h2": "1;38;5;116", "h3": "1;38;5;144", "h4": "1;38;5;179",
+        "accent": "38;5;109", "link": "4;38;5;110", "muted": "38;5;103", "line": "38;5;60",
+        "code": "38;5;152;48;5;238", "panel": "48;5;236", "label": "1;38;5;110",
+        "ok": "38;5;108", "NOTE": "1;38;5;110", "TIP": "1;38;5;108", "IMPORTANT": "1;38;5;139",
+        "WARNING": "1;38;5;179", "CAUTION": "1;38;5;167",
+    },
+    "dracula": {
+        "for": "dark", "pygments": "dracula",
+        "h1": "1;38;5;212", "h2": "1;38;5;141", "h3": "1;38;5;117", "h4": "1;38;5;84",
+        "accent": "38;5;212", "link": "4;38;5;117", "muted": "38;5;103", "line": "38;5;61",
+        "code": "38;5;228;48;5;238", "panel": "48;5;236", "label": "1;38;5;212",
+        "ok": "38;5;84", "NOTE": "1;38;5;117", "TIP": "1;38;5;84", "IMPORTANT": "1;38;5;141",
+        "WARNING": "1;38;5;228", "CAUTION": "1;38;5;203",
+    },
+    "solarized": {
+        "for": "any", "pygments": "solarized-dark",
+        "h1": "1;38;5;168", "h2": "1;38;5;32", "h3": "1;38;5;136", "h4": "1;38;5;100",
+        "accent": "38;5;166", "link": "4;38;5;37", "muted": "38;5;245", "line": "38;5;245",
+        "code": "38;5;37;48;5;236", "panel": "48;5;235", "label": "1;38;5;32",
+        "ok": "38;5;100", "NOTE": "1;38;5;32", "TIP": "1;38;5;100", "IMPORTANT": "1;38;5;62",
+        "WARNING": "1;38;5;136", "CAUTION": "1;38;5;160",
+    },
+}
+DEFAULT_THEME = "auto"  # paper on a light terminal, midnight otherwise
+
+THEME_SAMPLE = """\
+Text with **bold**, *italic*, `inline code` and a [link](https://example.com).
+
+- [x] done
+- [ ] to do
+
+> [!TIP]
+> A callout.
+
+```python
+def greet(name: str) -> str:
+    return f"Hello, {name}!"  # comment
+```
+
+| Column | Value |
+|--------|------:|
+| alpha  |     1 |
+| beta   |    22 |
+"""
+
+
+def build_theme(name, color):
+    """Expand a theme into the style table used by the renderer."""
+    global T, R, PYGMENTS_STYLE
+    t = THEMES[name]
+    styles = {
+        "h1": t["h1"], "h2": t["h2"], "h3": t["h3"], "h4": t["h4"], "h5": "1", "h6": "1;" + t["muted"],
+        "bold": "1", "italic": "3", "strike": "9;" + t["muted"], "muted": t["muted"],
+        "code": t["code"], "panel": t["panel"], "panel_fg": "38;5;253", "panel_label": t["label"],
+        "lineno": "38;5;246",
+        "link": t["link"], "url": t["muted"], "rule": t["line"], "bar": t["muted"], "table": t["line"],
+        "bullet": t["accent"], "th": t["h2"], "check": t["ok"], "uncheck": t["muted"],
     }
-    T = theme if color else {k: "" for k in theme}
+    for kind in ("NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION"):
+        styles[kind] = t[kind]
+    T = {k: (sgr(v) if color else "") for k, v in styles.items()}
     R = sgr("0") if color else ""
+    PYGMENTS_STYLE = t["pygments"] if color else None
+
+
+def detect_light_background():
+    """Best effort: ask the terminal for its background colour (OSC 11)."""
+    fgbg = os.environ.get("COLORFGBG", "")
+    if fgbg:
+        try:
+            return int(fgbg.split(";")[-1]) in (7, 15)
+        except ValueError:
+            pass
+    try:
+        import select
+        import termios
+        import tty
+
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    except (ImportError, OSError):
+        return False
+    buf = b""
+    try:
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            os.write(fd, b"\x1b]11;?\x07")
+            while select.select([fd], [], [], 0.15)[0]:
+                buf += os.read(fd, 64)
+                if buf.endswith(b"\x07") or buf.endswith(b"\x1b\\"):
+                    break
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except (OSError, termios.error):
+        return False
+    finally:
+        os.close(fd)
+    m = re.search(rb"rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)", buf)
+    if not m:
+        return False
+    r, g, b = (int(x, 16) / (16 ** len(x) - 1) for x in m.groups())
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.5
 
 
 # ---------------------------------------------------------------- text width
@@ -63,7 +192,7 @@ def build_theme(color):
 def vwidth(s):
     """Visible width of a string: ignores ANSI codes, counts wide chars as 2."""
     w = 0
-    for ch in ANSI_RE.sub("", s):
+    for ch in MARK_RE.sub("", ANSI_RE.sub("", s)):
         if unicodedata.combining(ch) or ch in "‍️":
             continue
         w += 2 if unicodedata.east_asian_width(ch) in "WF" else 1
@@ -97,10 +226,11 @@ def wrap(text, width):
                     cur_w += 1
                 continue
             w = vwidth(tok)
-            for piece in chunks(tok, width) if w > width else [tok]:
+            for idx, piece in enumerate(chunks(tok, width) if w > width else [tok]):
                 pw = vwidth(piece)
                 if cur_w and cur_w + pw > width:
-                    out.append(cur.rstrip(" ") + (R if active else ""))
+                    soft = zmark(SOFT_JOIN if idx else SOFT_SPACE)  # mid-word split or between words
+                    out.append(cur.rstrip(" ") + soft + (R if active else ""))
                     cur, cur_w = active, 0
                 cur += piece
                 cur_w += pw
@@ -139,6 +269,30 @@ TAG_RE = re.compile(
 )
 
 
+def linked(url, rendered):
+    """Record a link target and tag its rendered text with link marks."""
+    if not url:
+        return rendered
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", url):
+        if not url.startswith(("http:", "https:", "mailto:")):
+            return rendered
+        link = ("url", url, None)
+    else:
+        path, _, anchor = url.partition("#")
+        path = urllib.parse.unquote(path)
+        target = os.path.normpath(os.path.join(CTX["base"], path)) if path else None
+        link = ("file", target, anchor or None)
+    lid = len(CTX["links"])
+    if lid >= LINK_END - LINK_START:
+        return rendered
+    CTX["links"].append(link)
+    return chr(LINK_START + lid) + rendered + chr(LINK_END + lid)
+
+
+def plain(line):
+    return MARK_RE.sub("", ANSI_RE.sub("", line))
+
+
 def inline(text, base=""):
     """Render inline Markdown; `base` is the style to restore after each span."""
     out, pos = [], 0
@@ -151,16 +305,20 @@ def inline(text, base=""):
         pos = m.end()
         g = m.group
         if g("tick"):
-            out.append(T["code"] + g("code").strip() + R + base)
+            # One non-breaking space of padding inside the chip; it never wraps away.
+            padding = " " if T["code"] else ""
+            if padding:
+                padding = zmark(SKIP) + padding
+            out.append(T["code"] + padding + g("code").strip() + padding + R + base)
         elif g("src") is not None:
-            out.append(T["dim"] + "[image" + (": " + g("alt") if g("alt") else "") + "]" + R + base)
+            out.append(T["muted"] + "[image" + (": " + g("alt") if g("alt") else "") + "]" + R + base)
         elif g("ltext"):
-            out.append(span(T["link"], g("ltext")))
             url = g("url")
+            out.append(linked(url, span(T["link"], g("ltext"))))
             if url and url != g("ltext") and not url.startswith("#"):
                 out.append(" " + T["url"] + "(" + url + ")" + R + base)
         elif g("auto"):
-            out.append(T["link"] + g("auto") + R + base)
+            out.append(linked(g("auto"), T["link"] + g("auto") + R + base))
         elif g("bold"):
             out.append(span(T["bold"], g("bold")))
         elif g("strike"):
@@ -206,39 +364,115 @@ def starts_block(lines, i):
     )
 
 
-def highlight(code, lang):
-    if T["bold"] and lang:
+def find_lexer(hint):
+    """Pygments lexer for a language name, an extension or a file name, or None."""
+    try:
+        from pygments.lexers import get_lexer_by_name, get_lexer_for_filename
+        from pygments.util import ClassNotFound
+    except ImportError:
+        return None
+    opts = {"stripnl": False, "ensurenl": False}
+    for attempt in (
+        lambda: get_lexer_by_name(hint.lower(), **opts),
+        lambda: get_lexer_for_filename(hint, **opts),
+        lambda: get_lexer_for_filename("x." + hint, **opts),
+    ):
         try:
-            from pygments import highlight as pyg_highlight
-            from pygments.formatters import Terminal256Formatter
-            from pygments.lexers import get_lexer_by_name
-
-            res = pyg_highlight(code, get_lexer_by_name(lang), Terminal256Formatter(style="monokai"))
-            return res.rstrip("\n").split("\n")
-        except Exception:
+            return attempt()
+        except (ClassNotFound, ValueError):
             pass
-    return [T["block_fg"] + line + R for line in code.split("\n")]
+    return None
 
 
-def code_block(body, lang, width):
+def shell_tokens(tokens):
+    """Pygments leaves shell command names and flags as plain text: colour them."""
+    from pygments.token import Token
+
+    at_command = True
+    for ttype, value in tokens:
+        if ttype in Token.Text and value.strip():
+            word = value.strip()
+            if at_command and re.match(r"^[\w./~+@:-]+$", word):
+                ttype, at_command = Token.Name.Function, False
+            elif word.startswith("-"):
+                ttype = Token.Name.Attribute
+            else:
+                at_command = False
+        elif "\n" in value or ttype in Token.Generic.Prompt:
+            at_command = True
+        elif value.strip() in (";", "&&", "||", "|", "(", "$(", "`", "then", "do", "else", "elif", "if", "while",
+                               "until", "time", "!"):
+            at_command = True
+        elif ttype in Token.Keyword or ttype in Token.Name.Builtin:
+            at_command = False
+        yield ttype, value
+
+
+def highlight(code, lang):
+    """Highlighted lines (one per source line), or the plain lines."""
+    lexer = find_lexer(lang) if PYGMENTS_STYLE and lang else None
+    if lexer is None:
+        return code.split("\n")
+    try:
+        from pygments import format as pyg_format
+        from pygments.formatters import Terminal256Formatter
+
+        tokens = lexer.get_tokens(code)
+        if {"bash", "sh", "console", "shell-session"} & set(lexer.aliases):
+            tokens = shell_tokens(tokens)
+        res = pyg_format(tokens, Terminal256Formatter(style=PYGMENTS_STYLE))
+    except Exception:
+        return code.split("\n")
+    return res[:-1].split("\n") if res.endswith("\n") else res.split("\n")
+
+
+def code_block(body, lang, width, numbers=False, hint=None):
+    """A full box around a dark grey panel; long lines wrap inside the panel.
+
+    `numbers` adds a line-number gutter (for whole source files); `hint` picks
+    the highlighter (language, extension or file name) when it differs from the label.
+    """
+    if not numbers:
+        while body and not body[0].strip():
+            body.pop(0)
     while body and not body[-1].strip():
         body.pop()
-    b = T["rule"]
-    head = "╭─ " + lang + " " if lang else "╭"
-    out = [b + head + "─" * max(width - vwidth(head), 0) + R]
-    out += [b + "│ " + R + line + R for line in highlight("\n".join(body), lang)]
-    out.append(b + "╰" + "─" * (width - 1) + R)
+    numw = len(str(len(body))) if numbers else 0
+    gutter = numw + 2 if numbers else 0
+    b, bg, fg = T["table"], T["panel"], T["panel_fg"]
+    padx = 2  # spaces left and right of the code, inside the panel
+    inner = max(width - 2 - 2 * padx - gutter, 1)  # "│" + padding + [number] + text + padding + "│"
+    label = " " + lang + " " if lang else ""
+    top = b + "╭─" + R + T["panel_label"] + label + R + b + "─" * max(width - 3 - len(label), 0) + "╮" + R
+
+    zone = new_zone()
+
+    def row(text, num="", blank=False, soft=""):
+        number = T["lineno"] + num.rjust(numw) + "  " if numbers else ""
+        content = fg + ("" if blank else zmark(zone)) + pad(text, inner, "l") + soft + zmark(DECO)
+        return zmark(DECO) + b + "│" + R + bg + " " * padx + number + content + bg + " " * padx + R + b + "│" + R
+
+    out = [zmark(DECO) + top, row("", blank=True)]  # one blank panel line above the code
+    for n, line in enumerate(highlight("\n".join(body), hint or lang), 1):
+        # Pygments resets bold/italic with SGR 0, which also clears the panel: restore it.
+        if bg:
+            line = ANSI_RE.sub(lambda m: m.group(0) + bg, line)
+        pieces = chunks(line, inner) if vwidth(line) > inner else [line]
+        for k, piece in enumerate(pieces):
+            soft = zmark(SOFT_JOIN) if k < len(pieces) - 1 else ""  # a long line wrapped in the box
+            out.append(row(piece, str(n) if k == 0 else "", soft=soft))
+    out += [row("", blank=True), zmark(DECO) + b + "╰" + "─" * (width - 2) + "╯" + R]  # and one below
     return out
 
 
 def heading(level, text, width):
     st = T["h%d" % level]
     prefix = {3: "◆ ", 4: "◇ "}.get(level, "")
-    lines = wrap(st + prefix + inline(text, st) + R, width)
+    lines = wrap(st + deco(prefix) + inline(text, st) + R, width)
     if level == 1:
-        lines.append(T["h1"] + "━" * width + R)
+        lines.append(zmark(DECO) + T["h1"] + "━" * width + R)
     elif level == 2:
-        lines.append(T["rule"] + "─" * min(width, max(vwidth(l) for l in lines)) + R)
+        lines.append(zmark(DECO) + T["rule"] + "─" * min(width, max(vwidth(l) for l in lines)) + R)
     return lines
 
 
@@ -251,7 +485,7 @@ def blockquote(body, width, depth):
     inner = render(body, max(width - 2, 10), depth)
     if header:
         inner = [header] + inner
-    return [color + "│" + R + (" " + line if line else "") for line in inner]
+    return [deco(color + "│" + R + (" " if line else "")) + line for line in inner]
 
 
 def table(rows, width):
@@ -275,19 +509,29 @@ def table(rows, width):
     b = T["table"]
     sep = b + "│" + R
 
+    zones = [new_zone() for _ in range(ncol)]
+
     def border(left, mid, right):
-        return b + left + mid.join("─" * (w + 2) for w in widths) + right + R
+        return zmark(DECO) + b + left + mid.join("─" * (w + 2) for w in widths) + right + R
+
+    def cell(text, j):
+        """Cell text in its column zone; alignment padding is decoration."""
+        extra = max(widths[j] - vwidth(text), 0)
+        left = extra if aligns[j] == "r" else extra // 2 if aligns[j] == "c" else 0
+        return " " * left + zmark(zones[j]) + text + zmark(DECO) + " " * (extra - left)
 
     def row(cells):
         wrapped = [wrap(c, widths[j]) for j, c in enumerate(cells)]
         lines = []
         for k in range(max(len(w) for w in wrapped)):
-            parts = [pad(w[k] if k < len(w) else "", widths[j], aligns[j]) for j, w in enumerate(wrapped)]
-            lines.append(sep + sep.join(" " + p + " " for p in parts) + sep)
+            parts = [cell(w[k] if k < len(w) else "", j) for j, w in enumerate(wrapped)]
+            lines.append(zmark(DECO) + sep + sep.join(" " + p + " " for p in parts) + sep)
         return lines
 
-    out = [border("┌", "┬", "┐")] + row(head) + [border("├", "┼", "┤")]
-    for r in body:
+    out = [border("┌", "┬", "┐")] + row(head) + [border("╞", "╪", "╡").replace("─", "═")]
+    for k, r in enumerate(body):
+        if k:
+            out.append(border("├", "┼", "┤"))
         out += row(r)
     out.append(border("└", "┴", "┘"))
     return out
@@ -360,8 +604,8 @@ def list_block(lines, i, width, depth):
         if not loose:
             rendered = [line for line in rendered if line]
         rendered = rendered or [""]
-        out.append(label + rendered[0])
-        out += [" " * lw + line if line else "" for line in rendered[1:]]
+        out.append(deco(label) + rendered[0])
+        out += [deco(" " * lw) + line if line else "" for line in rendered[1:]]
         if loose and k < len(items) - 1:
             out.append("")
     return out, i
@@ -389,7 +633,7 @@ def render(lines, width, depth=0):
             out += heading(len(m.group(1)), m.group(2), width)
             i += 1
         elif HR_RE.match(line):
-            out.append(T["rule"] + "─" * width + R)
+            out.append(zmark(DECO) + T["rule"] + "─" * width + R)
             i += 1
         elif QUOTE_RE.match(line):
             body = []
@@ -453,6 +697,20 @@ def render(lines, width, depth=0):
     return clean
 
 
+def is_source(path):
+    """True for files to show as code rather than Markdown."""
+    name = os.path.basename(path)
+    ext = os.path.splitext(name)[1].lower()
+    if ext:
+        return ext not in MARKDOWN_EXT
+    return find_lexer(name) is not None  # Makefile, Dockerfile, ...
+
+
+def render_source(text, name, width):
+    """A whole source file: highlighted, with line numbers."""
+    return code_block(text.expandtabs(4).split("\n"), name, width, numbers=True)
+
+
 def render_document(text, width):
     text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
     lines = text.expandtabs(4).splitlines()
@@ -469,59 +727,704 @@ def render_document(text, width):
 # ---------------------------------------------------------------------- main
 
 
+MARKDOWN_EXT = (".md", ".markdown", ".mdown", ".mkd")
+MAX_FILE = 5 * 1024 * 1024
+
+
+def slug(text):
+    """GitHub-style heading anchor."""
+    return re.sub(r"[^\w\- ]", "", text.lower()).strip().replace(" ", "-")
+
+
+def link_spans(line):
+    """Screen columns of the links on a rendered line: [(start, end, link id)]."""
+    spans, col, open_at = [], 0, {}
+    for m in re.finditer(r"\x1b\[[0-9;]*m|.", line, re.S):
+        ch = m.group(0)
+        if ch.startswith("\x1b"):
+            continue
+        code = ord(ch)
+        if LINK_START <= code < LINK_END:
+            open_at[code - LINK_START] = col
+        elif code >= ZONE_BASE:
+            continue
+        elif code >= LINK_END:
+            lid = code - LINK_END
+            spans.append((open_at.pop(lid, 0), col, lid))
+        else:
+            col += vwidth(ch)
+    spans += [(c0, col, lid) for lid, c0 in open_at.items()]  # link continues on the next line
+    return spans
+
+
+TOKEN_RE = re.compile(r"\x1b\[[0-9;]*m|.", re.S)
+
+
+def walk_line(line):
+    """Yield (token, column, zone) for a rendered line; zone is None for invisible tokens."""
+    col, zone, skip = 0, BODY, False
+    for m in TOKEN_RE.finditer(line):
+        tok = m.group(0)
+        code = ord(tok) if len(tok) == 1 else 0
+        if code >= ZONE_BASE:
+            if code - ZONE_BASE == SKIP:
+                skip = True
+            elif code - ZONE_BASE not in FLAGS:
+                zone = code - ZONE_BASE
+            yield tok, col, None
+        elif tok[0] == "\x1b" or code >= LINK_START:
+            yield tok, col, None
+        else:
+            yield tok, col, DECO if skip else zone
+            skip = False
+            col += vwidth(tok)
+
+
+def zone_at(line, col):
+    zone = BODY
+    for _, c, z in walk_line(line):
+        if z is not None:
+            if c > col:
+                break
+            zone = z
+    return zone
+
+
+def selection_zone(lines, a, b):
+    """A selection that starts and ends in the same code block or table column stays inside it."""
+    za, zb = zone_at(lines[a[0]], a[1]), zone_at(lines[b[0]], b[1])
+    return za if za == zb and za > DECO else None
+
+
+def is_selected(pos, zone, a, b, only):
+    if zone is None or zone == DECO or (only is not None and zone != only):
+        return False
+    return a <= pos <= b
+
+
+def selected_text(lines, a, b, only="auto"):
+    """The text of a selection: decoration dropped, wrapped lines rejoined, table cells tab-separated."""
+    if only == "auto":
+        only = selection_zone(lines, a, b)
+    rows = []  # per screen line: [zone, text, soft break or None] segments
+    for ln in range(a[0], b[0] + 1):
+        segs, visible = [], False
+        for tok, col, z in walk_line(lines[ln]):
+            if z is None:
+                flag = ord(tok) - ZONE_BASE if len(tok) == 1 else -1
+                if flag in (SOFT_SPACE, SOFT_JOIN) and segs:
+                    segs[-1][2] = " " if flag == SOFT_SPACE else ""
+                continue
+            visible = True
+            if is_selected((ln, col), z, a, b, only):
+                if segs and segs[-1][0] == z and segs[-1][2] is None:
+                    segs[-1][1] += tok
+                else:
+                    segs.append([z, tok, None])
+        if segs:
+            rows.append(segs)
+        elif not visible and only is None:
+            rows.append([])  # a real blank line, not a border
+
+    merged = []
+    for segs in rows:
+        prev = merged[-1] if merged else None
+        if prev and segs and any(seg[2] is not None for seg in prev):
+            # This screen line continues the previous one: join each zone with its own text.
+            for z, t, soft in segs:
+                same = next((seg for seg in prev if seg[0] == z), None)
+                if same is None:
+                    prev.append([z, t, soft])
+                elif same[2] == "":
+                    same[1], same[2] = same[1] + t, soft
+                else:
+                    same[1], same[2] = same[1].rstrip(" ") + " " + t.lstrip(" "), soft
+        else:
+            merged.append(segs)
+
+    out = []
+    for segs in merged:
+        text = ""
+        for k, (z, t, _) in enumerate(segs):
+            if k and z > DECO and segs[k - 1][0] > DECO:
+                text = text.rstrip(" ") + "\t"
+            text += t
+        out.append(text.rstrip())
+    return "\n".join(out).strip("\n")
+
+
+WORD_RE = re.compile(r"[\w\-./~@+:%#?=&]")
+
+
+def word_at(line, col):
+    """(first column, last column, zone) of the word under a column, or None."""
+    cells = [(c, tok, z) for tok, c, z in walk_line(line) if z is not None]
+    k = next((i for i in range(len(cells) - 1, -1, -1) if cells[i][0] <= col), None)
+    if k is None or cells[k][2] == DECO or not WORD_RE.match(cells[k][1]):
+        return None
+    zone = cells[k][2]
+
+    def part_of_word(i):
+        return 0 <= i < len(cells) and cells[i][2] == zone and WORD_RE.match(cells[i][1])
+
+    i = j = k
+    while part_of_word(i - 1):
+        i -= 1
+    while part_of_word(j + 1):
+        j += 1
+    while j > i and cells[j][1] in ".,:;?!":  # sentence punctuation is not part of the word
+        j -= 1
+    return cells[i][0], cells[j][0], zone
+
+
+def block_at(lines, ln, col):
+    """(first line, last line, zone) of the text block under a position, or None.
+
+    A block is a paragraph or list item for body text, or the whole run of a
+    code block or table cell.
+    """
+    zone = zone_at(lines[ln], col)
+    if zone == DECO:
+        return None
+
+    def has_zone(line):
+        return any(z == zone for _, _, z in walk_line(line))
+
+    def item_start(line):
+        lead = ""
+        for tok, _, z in walk_line(line):
+            if z is None:
+                continue
+            if z != DECO:
+                break
+            lead += tok
+        return bool(re.search(r"[•◦▪▫✔☐]|\d+\.", lead))
+
+    first = last = ln
+    while first > 0 and has_zone(lines[first - 1]) and not (zone == BODY and item_start(lines[first])):
+        first -= 1
+    while last + 1 < len(lines) and has_zone(lines[last + 1]) and not (zone == BODY and item_start(lines[last + 1])):
+        last += 1
+    return first, last, zone
+
+
+def paint_selection(line, ln, a, b, only):
+    out, on = [], False
+    for tok, col, z in walk_line(line):
+        if z is None:
+            out.append(tok)
+            if on and tok[0] == "\x1b":
+                out.append("\x1b[7m")  # a style change inside the selection
+            continue
+        inside = is_selected((ln, col), z, a, b, only)
+        if inside != on:
+            out.append("\x1b[7m" if inside else "\x1b[27m")
+            on = inside
+        out.append(tok)
+    if on:
+        out.append("\x1b[27m")
+    return "".join(out)
+
+
+def copy_to_clipboard(text, tty_fd):
+    """System clipboard tool if there is one, else the OSC 52 escape sequence."""
+    import base64
+
+    env = dict(os.environ)
+    env.setdefault("LANG", "en_US.UTF-8")
+    if sys.platform == "darwin":
+        tools = [["pbcopy"]]
+    else:
+        tools = [["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]
+    for cmd in tools:
+        try:
+            subprocess.run(cmd, input=text.encode("utf-8"), env=env, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=3, check=True)
+            return
+        except (OSError, subprocess.SubprocessError):
+            continue
+    os.write(tty_fd, b"\x1b]52;c;" + base64.b64encode(text.encode("utf-8")) + b"\x07")
+
+
+def page(first, open_path, mouse=True):
+    """Full-screen viewer that re-renders when the window is resized and follows links.
+
+    `first` and the documents returned by `open_path(path)` are dicts with a
+    "title" and a "build(cols) -> (lines, links)" function. Returns False if no
+    terminal is available (the caller then prints instead).
+    """
+    import select
+    import signal
+    import termios
+    import time
+    import tty
+
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    except OSError:
+        return False
+    wake_r, wake_w = os.pipe()
+    os.set_blocking(wake_w, False)
+
+    def on_resize(*_):
+        try:
+            os.write(wake_w, b"r")
+        except BlockingIOError:
+            pass
+
+    def new_view(doc, anchor=None):
+        return {"doc": doc, "lines": [], "links": [], "occ": [], "cols": 0, "top": 0, "sel": None,
+                "anchor": anchor, "spans": {}, "selection": None, "sel_zone": "auto"}
+
+    out = sys.stdout
+    st = {"cur": new_view(first), "stack": [], "query": "", "input": None, "msg": "", "drag": None, "flash": None}
+
+    def flash(msg, seconds=2.5):
+        """A status message that disappears by itself."""
+        st["msg"], st["flash"] = msg, (msg, time.time() + seconds)
+
+    def size():
+        sz = os.get_terminal_size(fd)
+        return max(sz.columns, 10), max(sz.lines, 2)
+
+    def clip(line, cols):
+        return chunks(line, cols)[0] if vwidth(line) > cols else line
+
+    def describe(link):
+        kind, target, anchor = link
+        if kind == "url":
+            return target
+        return (os.path.relpath(target) if target else "") + ("#" + anchor if anchor else "")
+
+    def jump_to_anchor(cur, anchor):
+        want = slug(urllib.parse.unquote(anchor))
+        for ln, line in enumerate(cur["lines"]):
+            if slug(plain(line)) == want:
+                cur["top"] = ln
+                return
+        st["msg"] = "Section not found: #" + anchor
+
+    def layout(cur, cols):
+        """(Re-)render the document for a width, keeping position and selection."""
+        frac = cur["top"] / len(cur["lines"]) if cur["lines"] else 0
+        sel_id = cur["occ"][cur["sel"]][1] if cur["sel"] is not None else None
+        cur["lines"], cur["links"] = cur["doc"]["build"](cols)
+        cur["cols"] = cols
+        cur["selection"] = None  # positions change with the width
+        cur["occ"] = [(ln, ord(ch) - LINK_START) for ln, line in enumerate(cur["lines"])
+                      for ch in line if LINK_START <= ord(ch) < LINK_END]
+        cur["top"] = round(frac * len(cur["lines"]))
+        cur["sel"] = next((k for k, (_, lid) in enumerate(cur["occ"]) if lid == sel_id), None)
+        if cur["anchor"]:
+            jump_to_anchor(cur, cur["anchor"])
+            cur["anchor"] = None
+
+    def draw():
+        cur = st["cur"]
+        cols, rows = size()
+        body = rows - 1
+        if cols != cur["cols"]:
+            layout(cur, cols)
+        lines = cur["lines"]
+        cur["top"] = min(max(cur["top"], 0), max(len(lines) - body, 0))
+        top = cur["top"]
+        sel = cur["occ"][cur["sel"]][1] if cur["sel"] is not None else None
+        buf, cur["spans"] = ["\x1b[H"], {}
+        selection = None
+        if cur["selection"]:
+            a, b = sorted(cur["selection"])
+            only = selection_zone(lines, a, b) if cur["sel_zone"] == "auto" else cur["sel_zone"]
+            selection = (a, b, only)
+        for k in range(body):
+            line = lines[top + k] if top + k < len(lines) else ""
+            if selection and selection[0][0] <= top + k <= selection[1][0]:
+                line = paint_selection(line, top + k, *selection)
+            if MARK_RE.search(line):
+                cur["spans"][k] = link_spans(line)
+                if sel is not None:
+                    s, e = chr(LINK_START + sel), chr(LINK_END + sel)
+                    if e in line and s not in line:
+                        line = "\x1b[7m" + line
+                    line = line.replace(s, s + "\x1b[7m").replace(e, "\x1b[27m" + e)
+                line = MARK_RE.sub("", line)
+            buf.append("\x1b[K" + clip(line, cols) + "\x1b[0m\r\n")
+        end = min(top + body, len(lines))
+        if st["input"] is not None:
+            left, right = "/" + st["input"], ""
+        else:
+            pct = 100 if end >= len(lines) else end * 100 // max(len(lines), 1)
+            back = "  ← back" if st["stack"] else ""
+            if st["msg"]:
+                left = " " + st["msg"]
+            elif sel is not None:
+                left = " → " + describe(cur["links"][sel]) + "   (Enter to open)"
+            else:
+                left = " " + cur["doc"]["title"]
+            right = "%d-%d/%d %3d%%   Tab link%s  / search  q quit " % (top + 1, end, len(lines), pct, back)
+        status = left + " " * max(cols - vwidth(left) - vwidth(right), 1) + right
+        buf.append("\x1b[K\x1b[7m" + clip(status, cols) + "\x1b[0m")
+        buf.append("\x1b[?25h" if st["input"] is not None else "\x1b[?25l")
+        out.write("".join(buf))
+        out.flush()
+
+    def search(direction):
+        cur = st["cur"]
+        q, lines = st["query"].lower(), cur["lines"]
+        for step in range(1, len(lines) + 1):
+            idx = (cur["top"] + direction * step) % len(lines)
+            if q in plain(lines[idx]).lower():
+                cur["top"] = idx
+                return
+        st["msg"] = "Not found: " + st["query"]
+
+    def select_link(direction, body):
+        cur = st["cur"]
+        occ, top = cur["occ"], cur["top"]
+        if not occ:
+            st["msg"] = "No links in this document"
+            return
+        if cur["sel"] is not None and top <= occ[cur["sel"]][0] < top + body:
+            k = (cur["sel"] + direction) % len(occ)
+        elif direction > 0:
+            k = next((k for k, (ln, _) in enumerate(occ) if ln >= top), 0)
+        else:
+            k = next((k for k in range(len(occ) - 1, -1, -1) if occ[k][0] < top + body), len(occ) - 1)
+        cur["sel"] = k
+        ln = occ[k][0]
+        if not top <= ln < top + body:
+            cur["top"] = ln - body // 3
+
+    def follow():
+        cur = st["cur"]
+        kind, target, anchor = cur["links"][cur["occ"][cur["sel"]][1]]
+        if kind == "url":
+            opener = "open" if sys.platform == "darwin" else "xdg-open"
+            try:
+                subprocess.Popen([opener, target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                st["msg"] = "Opened in browser: " + target
+            except OSError:
+                st["msg"] = "Cannot open " + target
+        elif target is None:  # link to a section of this document
+            st["stack"].append(dict(cur))
+            jump_to_anchor(cur, anchor)
+        else:
+            doc, err = open_path(target)
+            if err:
+                st["msg"] = err
+            else:
+                st["stack"].append(cur)
+                st["cur"] = new_view(doc, anchor)
+
+    def go_back():
+        if st["stack"]:
+            st["cur"] = st["stack"].pop()
+        else:
+            st["msg"] = "Nothing to go back to"
+
+    def click(x, y):
+        """Follow the link under the pointer; True if there was one."""
+        cur = st["cur"]
+        for c0, c1, lid in cur["spans"].get(y, []):
+            if c0 <= x < c1:
+                cur["sel"] = next(k for k, (ln, i) in enumerate(cur["occ"]) if i == lid)
+                follow()
+                return True
+        return False
+
+    def copy_selection():
+        cur = st["cur"]
+        text = selected_text(cur["lines"], *sorted(cur["selection"]), only=cur["sel_zone"])
+        if text:
+            copy_to_clipboard(text, fd)
+            flash("Copied %d character%s to the clipboard" % (len(text), "" if len(text) == 1 else "s"))
+        else:
+            cur["selection"] = None
+
+    def multi_click(x, y):
+        """Count quick clicks at the same place: 1 = link, 2 = word, 3 = block."""
+        cur = st["cur"]
+        ln, now, last = cur["top"] + y, time.time(), st.get("last_click")
+        same = last and now - last[0] < 0.45 and last[1] == ln and abs(last[2] - x) <= 1 and last[4] is cur
+        count = last[3] % 3 + 1 if same else 1
+        st["last_click"] = (now, ln, x, count, cur)
+        if ln >= len(cur["lines"]):
+            return
+        if count == 1:
+            if click(x, y):
+                st["last_click"] = None  # the click opened a link: don't count it towards a double-click
+            return
+        found = word_at(cur["lines"][ln], x) if count == 2 else block_at(cur["lines"], ln, x)
+        if not found:
+            return
+        if count == 2:
+            c0, c1, zone = found
+            cur["selection"], cur["sel_zone"] = ((ln, c0), (ln, c1)), zone
+        else:
+            first, last_ln, zone = found
+            cur["selection"], cur["sel_zone"] = ((first, 0), (last_ln, 10 ** 9)), zone
+        copy_selection()
+
+    def handle(key):
+        """Process one key or mouse event; return False to quit."""
+        cur = st["cur"]
+        body = size()[1] - 1
+        if key.startswith("\x1b[<"):  # SGR mouse event: ESC [ < button ; x ; y M|m
+            button, x, y = (int(v) for v in key[3:-1].split(";"))
+            x, y, pressed = x - 1, y - 1, key.endswith("M")
+            if button == 64:
+                cur["top"] -= 3
+            elif button == 65:
+                cur["top"] += 3
+            elif button == 0 and pressed:  # button down: maybe a click, maybe a selection
+                st["msg"], cur["selection"] = "", None
+                cur["sel_zone"] = "auto"
+                st["drag"] = {"start": (cur["top"] + y, x), "moved": False, "x": x, "y": y}
+            elif button == 32 and pressed and st["drag"]:  # moved with the button held
+                if y <= 0:
+                    cur["top"] = max(cur["top"] - 1, 0)  # dragging past the edges scrolls
+                elif y >= body - 1:
+                    cur["top"] = min(cur["top"] + 1, max(len(cur["lines"]) - body, 0))
+                ln = min(max(cur["top"] + min(max(y, 0), body - 1), 0), max(len(cur["lines"]) - 1, 0))
+                st["drag"]["moved"] = True
+                cur["selection"] = (st["drag"]["start"], (ln, max(x, 0)))
+            elif not pressed and st["drag"]:  # button up
+                drag, st["drag"] = st["drag"], None
+                if not drag["moved"]:
+                    multi_click(drag["x"], drag["y"])
+                elif cur["selection"]:
+                    copy_selection()
+            return True
+        if st["input"] is not None:
+            if key in ("\r", "\n"):
+                st["query"], st["input"] = st["input"] or st["query"], None
+                if st["query"]:
+                    search(1)
+            elif key in ("\x1b", "\x03", "\x07"):
+                st["input"] = None
+            elif key in ("\x7f", "\x08"):
+                st["input"] = st["input"][:-1]
+            elif len(key) == 1 and key.isprintable():
+                st["input"] += key
+            return True
+        st["msg"] = ""
+        if key == "\x1b":
+            cur["selection"] = None
+        moves = {
+            "j": 1, "\x1b[B": 1, "\x1bOB": 1, "\n": 1, "e": 1,
+            "k": -1, "\x1b[A": -1, "\x1bOA": -1, "y": -1,
+            " ": body, "f": body, "\x1b[6~": body, "\x06": body,
+            "b": -body, "\x1b[5~": -body, "\x02": -body,
+            "d": body // 2, "\x04": body // 2, "u": -(body // 2), "\x15": -(body // 2),
+        }
+        if key in ("q", "Q", "\x03"):
+            return False
+        if key == "\r":
+            if cur["sel"] is not None and cur["top"] <= cur["occ"][cur["sel"]][0] < cur["top"] + body:
+                follow()
+            else:
+                cur["top"] += 1
+        elif key in moves:
+            cur["top"] += moves[key]
+        elif key in ("g", "<", "\x1b[H", "\x1bOH", "\x1b[1~"):
+            cur["top"] = 0
+        elif key in ("G", ">", "\x1b[F", "\x1bOF", "\x1b[4~"):
+            cur["top"] = len(cur["lines"])
+        elif key == "\t":
+            select_link(1, body)
+        elif key == "\x1b[Z":
+            select_link(-1, body)
+        elif key in ("\x7f", "\x08", "\x1b[D", "\x1bOD", "h"):
+            go_back()
+        elif key == "/":
+            st["input"] = ""
+        elif key in ("n", "N") and st["query"]:
+            search(1 if key == "n" else -1)
+        return True
+
+    mouse_on, mouse_off = ("\x1b[?1002h\x1b[?1006h", "\x1b[?1006l\x1b[?1002l") if mouse else ("", "")
+    old_attrs = termios.tcgetattr(fd)
+    old_handler = signal.signal(signal.SIGWINCH, on_resize)
+    try:
+        tty.setraw(fd)
+        out.write("\x1b[?1049h\x1b[?25l" + mouse_on)  # alternate screen, hide cursor, mouse
+        draw()
+        keys = re.compile(r"\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[[0-9;?]*[~A-Za-z]|\x1bO[A-Za-z]|.", re.S)
+        while True:
+            timeout = max(st["flash"][1] - time.time(), 0) if st["flash"] else None
+            ready = select.select([fd, wake_r], [], [], timeout)[0]
+            if st["flash"] and time.time() >= st["flash"][1]:
+                if st["msg"] == st["flash"][0]:
+                    st["msg"] = ""
+                st["flash"] = None
+            if wake_r in ready:
+                os.read(wake_r, 1024)
+                st["cur"]["cols"] = 0  # force a re-render even if only the height changed
+            if fd in ready:
+                data = os.read(fd, 1024).decode("utf-8", "replace")
+                for key in keys.findall(data):
+                    if not handle(key):
+                        return True
+            draw()
+    finally:
+        out.write(mouse_off + "\x1b[0m\x1b[?25h\x1b[?1049l")
+        out.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        signal.signal(signal.SIGWINCH, old_handler)
+        for f in (fd, wake_r, wake_w):
+            os.close(f)
+
+
+def directory_listing(path, title):
+    """A Markdown document listing a directory, one link per entry."""
+    def esc(name):
+        return re.sub(r"([\\`*_\[\]~<>])", r"\\\1", name)
+
+    names = [n for n in os.listdir(path) if not n.startswith(".")]
+    names.sort(key=lambda n: (not os.path.isdir(os.path.join(path, n)), n.lower()))
+    items = []
+    for n in names:
+        slash = "/" if os.path.isdir(os.path.join(path, n)) else ""
+        items.append("- [%s%s](%s%s)" % (esc(n), slash, urllib.parse.quote(n), slash))
+    return "# %s\n\n%s\n" % (title, "\n".join(items) or "*(empty)*")
+
+
 def main():
     ap = argparse.ArgumentParser(prog="mdv", description="Display Markdown nicely in the terminal.")
     ap.add_argument("files", nargs="*", help="Markdown files (none or '-' reads stdin)")
-    ap.add_argument("-w", "--width", type=int, help="wrap width (default: terminal width, max 100)")
-    ap.add_argument("-P", "--no-pager", action="store_true", help="never page output through less")
+    ap.add_argument("-w", "--width", type=int, help="wrap width (default: full terminal width, follows resizes)")
+    ap.add_argument("-P", "--no-pager", action="store_true", help="print directly, never page")
+    ap.add_argument("-p", "--page", action="store_true", help="always open the pager, even for short documents")
+    ap.add_argument(
+        "--pager",
+        choices=["builtin", "less"],
+        default=os.environ.get("MDV_PAGER", "builtin"),
+        help="pager for long output (default: $MDV_PAGER or builtin, which re-wraps on resize and follows links)",
+    )
+    ap.add_argument("--no-mouse", action="store_true", help="builtin pager: leave the mouse to the terminal")
     ap.add_argument("--color", choices=["auto", "always", "never"], default="auto")
+    ap.add_argument(
+        "-t",
+        "--theme",
+        choices=["auto"] + list(THEMES),
+        default=os.environ.get("MDV_THEME", DEFAULT_THEME),
+        help="colour theme (default: $MDV_THEME or auto: paper on a light terminal, midnight otherwise)",
+    )
+    ap.add_argument("-l", "--language", help="show the input as source code in this language (e.g. for stdin)")
+    ap.add_argument("--list-themes", action="store_true", help="preview every theme and exit")
     args = ap.parse_args()
+    if args.theme not in THEMES and args.theme != "auto":
+        ap.error("unknown theme %r (MDV_THEME); choose from: auto, %s" % (args.theme, ", ".join(THEMES)))
+    if args.pager not in ("builtin", "less"):
+        ap.error("unknown pager %r (MDV_PAGER); choose from: builtin, less" % args.pager)
 
     tty = sys.stdout.isatty()
     if args.color == "auto":
         color = tty and not os.environ.get("NO_COLOR")
     else:
         color = args.color == "always"
-    build_theme(color)
+    theme = args.theme
+    if theme == "auto":
+        theme = "paper" if color and detect_light_background() else "midnight"
+    build_theme(theme, color)
 
-    cols, rows = shutil.get_terminal_size((80, 24))
-    width = args.width or min(cols, 100)
-
-    out = []
-    files = args.files or ["-"]
-    for idx, path in enumerate(files):
+    files = [] if args.list_themes else (args.files or ["-"])
+    texts = []
+    for path in files:
         try:
             if path == "-":
-                text = sys.stdin.read()
+                texts.append(sys.stdin.read())
             else:
                 with open(path, encoding="utf-8", errors="replace") as f:
-                    text = f.read()
+                    texts.append(f.read())
         except OSError as e:
             print("mdv: %s: %s" % (path, e.strerror), file=sys.stderr)
             return 1
-        if len(files) > 1:
-            if idx:
-                out += ["", ""]
-            out += [T["dim"] + "── " + path + " " + "─" * max(width - len(path) - 4, 0) + R, ""]
-        out += render_document(text, width)
 
-    doc = "\n".join(out) + "\n"
-    if tty and not args.no_pager and len(out) >= rows:
+    def build_first(cols):
+        width = args.width or cols
+        out, CTX["links"], CTX["zones"] = [], [], DECO
+        if args.list_themes:
+            for name, t in THEMES.items():
+                build_theme(name, color)
+                title = "%s  (for %s backgrounds%s)" % (name, t["for"], ", default" if name == theme else "")
+                out += render_document("## " + title + "\n\n" + THEME_SAMPLE, min(width, 72)) + ["", ""]
+            build_theme(theme, color)
+            return out, CTX["links"]
+        for idx, (path, text) in enumerate(zip(files, texts)):
+            CTX["base"] = os.path.dirname(os.path.abspath(path)) if path != "-" else os.getcwd()
+            if len(files) > 1:
+                if idx:
+                    out += ["", ""]
+                out += [zmark(DECO) + T["muted"] + "── " + path + " " + "─" * max(width - len(path) - 4, 0) + R, ""]
+            if args.language:
+                out += code_block(text.expandtabs(4).split("\n"), args.language, width, numbers=True)
+            elif path != "-" and is_source(path):
+                out += render_source(text, os.path.basename(path), width)
+            else:
+                out += render_document(text, width)
+        return out, CTX["links"]
+
+    def make_doc(title, text, base, source=None):
+        def build(cols):
+            CTX["base"], CTX["links"], CTX["zones"] = base, [], DECO
+            if source:
+                return render_source(text, source, args.width or cols), CTX["links"]
+            return render_document(text, args.width or cols), CTX["links"]
+
+        return {"title": title, "build": build}
+
+    def open_path(path):
+        """Open a link target in the pager: Markdown, a directory, or any text file."""
+        rel = os.path.relpath(path)
+        if os.path.isdir(path):
+            for name in ("README.md", "readme.md", "Readme.md", "index.md"):
+                if os.path.isfile(os.path.join(path, name)):
+                    path, rel = os.path.join(path, name), os.path.join(rel, name)
+                    break
+            else:
+                try:
+                    return make_doc(rel + "/", directory_listing(path, rel + "/"), path), None
+                except OSError as e:
+                    return None, "Cannot open %s: %s" % (rel, e.strerror)
+        try:
+            if os.path.getsize(path) > MAX_FILE:
+                return None, "File too large: " + rel
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            return None, "Cannot open %s: %s" % (rel, e.strerror)
+        if b"\0" in data[:8192]:
+            return None, "Binary file: " + rel
+        text = data.decode("utf-8", "replace")
+        source = os.path.basename(path) if is_source(path) else None
+        return make_doc(rel, text, os.path.dirname(path), source), None
+
+    cols, rows = shutil.get_terminal_size((80, 24))
+    out = build_first(cols)[0]
+    if tty and not args.no_pager and (args.page or len(out) >= rows):
+        title = "themes" if args.list_themes else ", ".join("stdin" if f == "-" else f for f in files)
+        first = {"title": title, "build": build_first}
+        if args.pager == "builtin" and page(first, open_path, mouse=not args.no_mouse):
+            return 0
         try:
             env = dict(os.environ, LESSCHARSET="utf-8")
             pager = subprocess.Popen(["less", "-R"], stdin=subprocess.PIPE, env=env)
             try:
-                pager.communicate(doc.encode("utf-8"))
+                pager.communicate(("\n".join(plain_marks(out)) + "\n").encode("utf-8"))
             except (BrokenPipeError, KeyboardInterrupt):
                 pass
             return 0
         except OSError:
             pass
     try:
-        sys.stdout.write(doc)
+        sys.stdout.write("\n".join(plain_marks(out)) + "\n")
     except BrokenPipeError:
         pass
     return 0
+
+
+def plain_marks(lines):
+    return [MARK_RE.sub("", line) for line in lines]
 
 
 if __name__ == "__main__":
