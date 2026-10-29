@@ -420,10 +420,10 @@ def highlight(code, lang):
         from pygments import format as pyg_format
         from pygments.formatters import Terminal256Formatter
 
-        tokens = lexer.get_tokens(code)
+        tokens = lexer.get_tokens(code + "\n")  # bash only sees a last-line comment before a newline
         if {"bash", "sh", "console", "shell-session"} & set(lexer.aliases):
             tokens = shell_tokens(tokens)
-        res = pyg_format(tokens, Terminal256Formatter(style=PYGMENTS_STYLE))
+        res =pyg_format(tokens, Terminal256Formatter(style=PYGMENTS_STYLE))
     except Exception:
         return code.split("\n")
     return res[:-1].split("\n") if res.endswith("\n") else res.split("\n")
@@ -860,10 +860,10 @@ def h_code(body, lang=""):
             from pygments import format as pyg_format
             from pygments.formatters import HtmlFormatter
 
-            tokens = lexer.get_tokens(code)
+            tokens = lexer.get_tokens(code + "\n")  # bash only sees a last-line comment before a newline
             if {"bash", "sh", "console", "shell-session"} & set(lexer.aliases):
                 tokens = shell_tokens(tokens)
-            inner = pyg_format(tokens, HtmlFormatter(nowrap=True)).rstrip("\n")
+            inner =pyg_format(tokens, HtmlFormatter(nowrap=True)).rstrip("\n")
         except Exception:
             inner = None
     if inner is None:
