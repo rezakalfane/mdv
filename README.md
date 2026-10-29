@@ -23,6 +23,7 @@ mdv README.md
 - **Other:** horizontal rules, YAML front matter (shown as a framed block), hard line breaks, `<br>`. HTML comments and common HTML tags are hidden.
 - **Layout:** uses the full terminal width and handles wide characters (CJK, emoji).
 - **Pager:** long documents open in a built-in full-screen pager that re-wraps the document when you resize the window, follows links (keyboard or mouse click), scrolls with the mouse wheel, and copies selected text to the clipboard. `less` is available as an alternative.
+- **PDF:** `--pdf` writes a print-styled PDF (A4 or Letter) instead of printing: headings with accent rules, highlighted code panels with the language label, zebra tables, coloured callouts, task lists, images, links, and a running title with page numbers.
 - **Colour:** off automatically when output is not a terminal, and when `NO_COLOR` is set. Uses the 256-colour palette, so it works in macOS Terminal, iTerm2 and most Linux terminals.
 
 ## Requirements
@@ -30,6 +31,7 @@ mdv README.md
 - Python 3.8 or newer
 - Optional: Pygments, for syntax highlighting (`pip install pygments`)
 - Optional: `less`, only if you choose `--pager less`
+- For `--pdf`: Google Chrome, Chromium, Edge or Brave (found automatically, or set `MDV_CHROME` to the binary), or else [WeasyPrint](https://weasyprint.org/) (`pip install weasyprint`)
 
 ## Installation
 
@@ -58,7 +60,7 @@ export PATH="$HOME/.local/bin:$PATH"
 ## Usage
 
 ```
-mdv [-h] [-w WIDTH] [-P] [-p] [--pager {builtin,less}] [--no-mouse] [--color {auto,always,never}] [-t THEME] [-l LANG] [--list-themes] [files ...]
+mdv [-h] [-w WIDTH] [-P] [-p] [--pager {builtin,less}] [--no-mouse] [--color {auto,always,never}] [-t THEME] [-l LANG] [--list-themes] [--pdf] [-o FILE] [--paper SIZE] [files ...]
 ```
 
 | Option | Description |
@@ -73,6 +75,9 @@ mdv [-h] [-w WIDTH] [-P] [-p] [--pager {builtin,less}] [--no-mouse] [--color {au
 | `-t`, `--theme THEME` | Colour theme: `auto` (default), `midnight`, `paper`, `nord`, `dracula`, `solarized`. |
 | `-l`, `--language LANG` | Show the input as source code in this language, with line numbers (useful with stdin). |
 | `--list-themes` | Preview every theme on a sample document, then exit. |
+| `--pdf` | Write a PDF instead of printing. Each input `FILE.md` becomes `FILE.pdf` next to it (stdin: `mdv.pdf`). |
+| `-o`, `--output FILE` | With `--pdf`: the output file (single input only). |
+| `--paper SIZE` | With `--pdf`: `a4` (default, or `$MDV_PAPER`), `letter`, `legal`, `a3`, `a5`. |
 
 Examples:
 
@@ -88,6 +93,9 @@ mdv -t nord file.md         # use the nord theme
 mdv src/main.rs             # a source file: highlighted, with line numbers
 curl -s https://api.github.com | mdv -l json   # highlight stdin as JSON
 mdv --list-themes           # preview all themes
+mdv --pdf README.md         # write README.pdf
+mdv --pdf --paper letter -o out.pdf notes.md
+cat notes.md | mdv --pdf -o notes.pdf
 ```
 
 ## Pager

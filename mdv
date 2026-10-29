@@ -7,11 +7,14 @@ Standard library only. If Pygments is installed, fenced code blocks are
 syntax highlighted. Honours NO_COLOR. Long output opens in a built-in pager that re-wraps on resize.
 """
 import argparse
+import html
 import os
+import pathlib
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import unicodedata
 import urllib.parse
 
@@ -546,7 +549,8 @@ def split_row(line):
     return [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", s)]
 
 
-def list_block(lines, i, width, depth):
+def parse_list(lines, i):
+    """Parse one list starting at line i: (items as line lists, loose, ordered, start number, next line)."""
     n = len(lines)
     first = LIST_RE.match(lines[i])
     base = len(first.group(1))
@@ -588,6 +592,11 @@ def list_block(lines, i, width, depth):
         if k > i and s and len(s.group(1)) == base and s.group(2)[0].isdigit() == ordered and not HR_RE.match(lines[k]):
             i, loose = k, True
 
+    return items, loose, ordered, start, i
+
+
+def list_block(lines, i, width, depth):
+    items, loose, ordered, start, i = parse_list(lines, i)
     lw = (len(str(start + len(items) - 1)) + 2) if ordered else 2
     out = []
     for k, body in enumerate(items):
@@ -722,6 +731,348 @@ def render_document(text, width):
                 lines = lines[k + 1 :]
                 break
     return out + render(lines, width)
+
+
+# ------------------------------------------------------------------------ PDF
+#
+# --pdf renders the Markdown to a styled HTML page (same block and inline
+# grammar as the terminal renderer above) and prints it to PDF with headless
+# Chrome/Chromium/Edge/Brave, or WeasyPrint when no browser is found.
+
+HTML_KEEP = {"kbd", "sub", "sup", "b", "i", "em", "strong", "u", "small"}
+HCTX = {"ids": {}, "title": None}
+PAPERS = {"a4": "A4", "letter": "Letter", "legal": "Legal", "a3": "A3", "a5": "A5"}
+
+PDF_CSS = r"""
+@page { size: @@PAPER@@; margin: 22mm 20mm 24mm 20mm;
+  @bottom-left { content: "@@TITLE@@"; font: 8pt/1 -apple-system, "Helvetica Neue", Arial, sans-serif; color: #8a94a3; }
+  @bottom-right { content: counter(page) " / " counter(pages); font: 8pt/1 -apple-system, "Helvetica Neue", Arial, sans-serif; color: #8a94a3; } }
+* { box-sizing: border-box; }
+html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+body { margin: 0; color: #1f2933; background: #fff; font: 10.5pt/1.6 -apple-system, "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-kerning: normal; text-rendering: optimizeLegibility; orphans: 3; widows: 3; overflow-wrap: break-word; }
+h1, h2, h3, h4, h5, h6 { color: #0f1b2d; line-height: 1.25; font-weight: 700; break-after: avoid; page-break-after: avoid; }
+h1 { font-size: 27pt; letter-spacing: -0.02em; margin: 0 0 0.9em; padding-bottom: 0.35em; border-bottom: 3px solid #2457c5; }
+h2 { font-size: 17pt; letter-spacing: -0.01em; margin: 1.7em 0 0.6em; padding-bottom: 0.25em; border-bottom: 1px solid #d7dde5; }
+h3 { font-size: 13pt; margin: 1.5em 0 0.5em; color: #1b3a6b; }
+h4 { font-size: 10.5pt; margin: 1.3em 0 0.4em; text-transform: uppercase; letter-spacing: 0.06em; color: #52606d; }
+h5, h6 { font-size: 10.5pt; margin: 1.2em 0 0.3em; color: #52606d; }
+h1:not(:first-child) { margin-top: 1.6em; }
+p { margin: 0 0 0.85em; }
+a { color: #2457c5; text-decoration: none; border-bottom: 1px solid rgba(36, 87, 197, 0.35); }
+strong { font-weight: 650; color: #0f1b2d; }
+del { color: #7b8794; }
+hr { border: 0; height: 1px; background: #d7dde5; margin: 1.8em 0; }
+ul, ol { margin: 0 0 0.9em; padding-left: 1.5em; }
+li { margin: 0.22em 0; padding-left: 0.2em; }
+li > ul, li > ol { margin: 0.25em 0 0.3em; }
+li::marker { color: #2457c5; }
+li.task { list-style: none; margin-left: -1.4em; }
+.box { display: inline-block; width: 1.05em; height: 1.05em; margin-right: 0.5em; border: 1.4px solid #9aa5b1; border-radius: 3px;
+  vertical-align: -0.12em; font-size: 0.85em; line-height: 0.95em; text-align: center; }
+.box.done { background: #2457c5; border-color: #2457c5; color: #fff; }
+code, pre { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace; }
+:not(pre) > code { font-size: 0.86em; background: #eef1f5; border-radius: 4px; padding: 0.1em 0.38em; color: #7a2b6b; }
+figure.code { margin: 0 0 1.1em; border: 1px solid #d7dde5; border-left: 3px solid #2457c5; border-radius: 6px; background: #f6f8fb; overflow: hidden; }
+figure.code.short { break-inside: avoid; page-break-inside: avoid; }
+figure.code .lang { padding: 0.28em 0.9em; font: 600 7.5pt/1.4 -apple-system, "Helvetica Neue", Arial, sans-serif; text-transform: uppercase;
+  letter-spacing: 0.08em; color: #52606d; background: #eaeef4; border-bottom: 1px solid #d7dde5; }
+figure.code pre { margin: 0; padding: 0.8em 1em; font-size: 8.6pt; line-height: 1.5; white-space: pre-wrap; word-break: break-word; tab-size: 4; }
+figure.code code { background: none; padding: 0; color: #1f2933; font-size: inherit; }
+blockquote { margin: 0 0 1em; padding: 0.5em 1.1em; border-left: 3px solid #b8c2cf; background: #f7f9fb; color: #3e4c59; border-radius: 0 6px 6px 0; }
+blockquote > :last-child, .alert > :last-child { margin-bottom: 0; }
+.alert { margin: 0 0 1em; padding: 0.7em 1.1em; border-left: 4px solid var(--c); background: var(--bg); border-radius: 0 6px 6px 0; break-inside: avoid; }
+.alert-title { margin: 0 0 0.3em; font: 700 8.5pt/1.3 -apple-system, "Helvetica Neue", Arial, sans-serif; letter-spacing: 0.08em; text-transform: uppercase; color: var(--c); }
+.alert.note { --c: #2457c5; --bg: #eef3fc; } .alert.tip { --c: #1a7f4b; --bg: #edf8f1; }
+.alert.important { --c: #7b3fc4; --bg: #f4eefb; } .alert.warning { --c: #a66300; --bg: #fff6e5; } .alert.caution { --c: #c0332b; --bg: #fdeeed; }
+table { width: 100%; border-collapse: collapse; margin: 0 0 1.2em; font-size: 9.4pt; line-height: 1.45; border: 1px solid #d7dde5; }
+thead { display: table-header-group; }
+th { text-align: left; font-weight: 650; color: #0f1b2d; background: #eaeff6; border-bottom: 2px solid #2457c5; padding: 0.5em 0.75em; }
+td { padding: 0.45em 0.75em; border-top: 1px solid #e3e8ee; vertical-align: top; }
+tbody tr:nth-child(even) td { background: #f8fafc; }
+tr { break-inside: avoid; page-break-inside: avoid; }
+.r { text-align: right; } .c { text-align: center; }
+img { max-width: 100%; height: auto; border-radius: 4px; }
+p.figure { text-align: center; break-inside: avoid; }
+kbd { font: 0.85em "SF Mono", Menlo, monospace; padding: 0.1em 0.4em; border: 1px solid #c6cfda; border-bottom-width: 2px; border-radius: 4px; background: #f7f9fb; }
+"""
+
+
+def h_text(s):
+    """Escape plain text; keep a few simple tags (without attributes), drop the other HTML."""
+    out, pos = [], 0
+    for m in TAG_RE.finditer(s):
+        out.append(html.escape(s[pos : m.start()], quote=False))
+        pos = m.end()
+        name = re.match(r"</?(\w+)", m.group(0)).group(1).lower()
+        if name in HTML_KEEP:
+            out.append("<%s%s>" % ("/" if m.group(0).startswith("</") else "", name))
+    out.append(html.escape(s[pos:], quote=False))
+    return "".join(out)
+
+
+def h_inline(text):
+    out, pos = [], 0
+    for m in INLINE_RE.finditer(text):
+        out.append(h_text(text[pos : m.start()]))
+        pos = m.end()
+        g = m.group
+        if g("tick"):
+            out.append("<code>%s</code>" % html.escape(g("code").strip(), quote=False))
+        elif g("src") is not None:
+            out.append('<img src="%s" alt="%s">' % (html.escape(g("src")), html.escape(g("alt"))))
+        elif g("ltext"):
+            out.append('<a href="%s">%s</a>' % (html.escape(g("url")), h_inline(g("ltext"))))
+        elif g("auto"):
+            out.append('<a href="%s">%s</a>' % (html.escape(g("auto")), html.escape(g("auto"), quote=False)))
+        elif g("bold"):
+            out.append("<strong>%s</strong>" % h_inline(g("bold")))
+        elif g("strike"):
+            out.append("<del>%s</del>" % h_inline(g("strike")))
+        elif g("em") or g("em2"):
+            out.append("<em>%s</em>" % h_inline(g("em") or g("em2")))
+        elif g("esc"):
+            out.append(html.escape(g("esc"), quote=False))
+    out.append(h_text(text[pos:]))
+    return "".join(out).replace("\n", "<br>")
+
+
+def h_heading(level, text):
+    inner = h_inline(text)
+    plain_text = html.unescape(re.sub(r"<[^>]+>", "", inner))
+    if level == 1 and HCTX["title"] is None:
+        HCTX["title"] = plain_text
+    base = slug(plain_text) or "section"
+    n = HCTX["ids"].get(base, 0)
+    HCTX["ids"][base] = n + 1
+    return '<h%d id="%s">%s</h%d>' % (level, base if not n else "%s-%d" % (base, n), inner, level)
+
+
+def h_code(body, lang=""):
+    while body and not body[0].strip():
+        body.pop(0)
+    while body and not body[-1].strip():
+        body.pop()
+    code = "\n".join(body)
+    inner, lexer = None, find_lexer(lang) if lang else None
+    if lexer is not None:
+        try:
+            from pygments import format as pyg_format
+            from pygments.formatters import HtmlFormatter
+
+            tokens = lexer.get_tokens(code)
+            if {"bash", "sh", "console", "shell-session"} & set(lexer.aliases):
+                tokens = shell_tokens(tokens)
+            inner = pyg_format(tokens, HtmlFormatter(nowrap=True)).rstrip("\n")
+        except Exception:
+            inner = None
+    if inner is None:
+        inner = html.escape(code, quote=False)
+    label = '<div class="lang">%s</div>' % html.escape(lang) if lang else ""
+    return '<figure class="code%s">%s<pre><code>%s</code></pre></figure>' % (
+        " short" if len(body) <= 30 else "", label, inner)
+
+
+def h_table(rows):
+    header = split_row(rows[0])
+    ncol = len(header)
+    aligns = []
+    for c in split_row(rows[1])[:ncol]:
+        aligns.append("c" if c.startswith(":") and c.endswith(":") else "r" if c.endswith(":") else "")
+    aligns += [""] * (ncol - len(aligns))
+
+    def cells(tag, row):
+        return "".join(
+            "<%s%s>%s</%s>" % (tag, ' class="%s"' % a if a else "", h_inline(c), tag)
+            for c, a in zip((row + [""] * ncol)[:ncol], aligns)
+        )
+
+    body = "".join("<tr>%s</tr>" % cells("td", split_row(r)) for r in rows[2:])
+    return "<table><thead><tr>%s</tr></thead><tbody>%s</tbody></table>" % (cells("th", header), body)
+
+
+def h_quote(body):
+    kind = None
+    if body and (a := ALERT_RE.match(body[0])):
+        kind, body = a.group(1).lower(), body[1:]
+    inner = h_blocks(body)
+    if kind:
+        return '<aside class="alert %s"><p class="alert-title">%s</p>%s</aside>' % (kind, kind.title(), inner)
+    return "<blockquote>%s</blockquote>" % inner
+
+
+def h_list(lines, i):
+    items, loose, ordered, start, i = parse_list(lines, i)
+    out = []
+    for body in items:
+        task = re.match(r"^\[([ xX])\]\s+(.*)$", body[0])
+        box = ""
+        if task:
+            box = '<span class="box%s">%s</span>' % (" done" if task.group(1) != " " else "", "✔" if task.group(1) != " " else "")
+            body[0] = task.group(2)
+        out.append("<li%s>%s%s</li>" % (' class="task"' if task else "", box, h_blocks(body, tight=not loose)))
+    tag = "ol" if ordered else "ul"
+    return "<%s%s>%s</%s>" % (tag, ' start="%d"' % start if ordered and start != 1 else "", "".join(out), tag), i
+
+
+def h_blocks(lines, tight=False):
+    out, i, n = [], 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if not line.strip():
+            i += 1
+            continue
+        if m := FENCE_RE.match(line):
+            ind, fence, lang = len(m.group(1)), m.group(2), m.group(3)
+            close = re.compile(r"^\s*%s{%d,}\s*$" % (re.escape(fence[0]), len(fence)))
+            body, i = [], i + 1
+            while i < n and not close.match(lines[i]):
+                body.append(lines[i][min(ind, indent_of(lines[i])) :])
+                i += 1
+            i += 1
+            out.append(h_code(body, lang))
+        elif m := HEADING_RE.match(line):
+            out.append(h_heading(len(m.group(1)), m.group(2)))
+            i += 1
+        elif HR_RE.match(line):
+            out.append("<hr>")
+            i += 1
+        elif QUOTE_RE.match(line):
+            body = []
+            while i < n and lines[i].strip():
+                if q := QUOTE_RE.match(lines[i]):
+                    body.append(q.group(1))
+                elif starts_block(lines, i):
+                    break
+                else:
+                    body.append(lines[i])
+                i += 1
+            out.append(h_quote(body))
+        elif LIST_RE.match(line):
+            block, i = h_list(lines, i)
+            out.append(block)
+        elif is_table(lines, i):
+            rows = [lines[i], lines[i + 1]]
+            i += 2
+            while i < n and lines[i].strip() and "|" in lines[i]:
+                rows.append(lines[i])
+                i += 1
+            out.append(h_table(rows))
+        elif line.startswith("    "):
+            body = []
+            while i < n and (lines[i].startswith("    ") or not lines[i].strip()):
+                body.append(lines[i][4:])
+                i += 1
+            out.append(h_code(body))
+        else:
+            para, level = [line], 0
+            i += 1
+            while i < n and lines[i].strip():
+                if s := SETEXT_RE.match(lines[i]):
+                    level = 1 if s.group(1)[0] == "=" else 2
+                    i += 1
+                    break
+                if starts_block(lines, i):
+                    break
+                para.append(lines[i])
+                i += 1
+            text = ""
+            for k, p in enumerate(para):
+                hard = p.endswith("  ") or p.rstrip().endswith("\\")
+                s = p.strip()
+                s = s[:-1] if s.endswith("\\") else s
+                text += s + ("\n" if hard and k < len(para) - 1 else " ")
+            text = re.sub(r"<br\s*/?>", "\n", text.strip(), flags=re.I)
+            if level:
+                out.append(h_heading(level, text))
+            elif tight:
+                out.append(h_inline(text))
+            else:
+                figure = re.fullmatch(r"!\[[^\]]*\]\([^)]*\)", text)
+                out.append('<p%s>%s</p>' % (' class="figure"' if figure else "", h_inline(text)))
+    return "\n".join(out)
+
+
+def html_document(text, name, base, paper="A4", source_lang=None):
+    """A complete, print-styled HTML page for a Markdown document (or a source file)."""
+    HCTX["ids"], HCTX["title"] = {}, None
+    text = text.expandtabs(4)
+    if source_lang is not None:
+        body = h_code(text.split("\n"), source_lang)
+    else:
+        text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+        lines = text.splitlines()
+        front = ""
+        if lines and lines[0].strip() == "---":  # YAML front matter
+            for k in range(1, len(lines)):
+                if lines[k].strip() in ("---", "..."):
+                    front, lines = h_code(lines[1:k], "yaml"), lines[k + 1 :]
+                    break
+        body = front + h_blocks(lines)
+    title = HCTX["title"] or name
+    css = PDF_CSS.replace("@@PAPER@@", paper).replace(
+        "@@TITLE@@", title.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " "))
+    try:
+        from pygments.formatters import HtmlFormatter
+
+        css += HtmlFormatter(style="friendly").get_style_defs("figure.code")
+        css += "figure.code .hll, figure.code .w { background: none; }\n"
+    except ImportError:
+        pass
+    return (
+        '<!DOCTYPE html>\n<html lang="en"><head><meta charset="utf-8"><title>%s</title>\n'
+        '<base href="%s"><style>%s</style></head>\n<body>\n%s\n</body></html>\n'
+        % (html.escape(title, quote=False), html.escape(pathlib.Path(os.path.abspath(base)).as_uri() + "/"), css, body)
+    )
+
+
+def find_browser():
+    """A Chromium-based browser able to print PDFs headlessly, or None."""
+    if os.environ.get("MDV_CHROME"):
+        return os.environ["MDV_CHROME"]
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome",
+                 "microsoft-edge", "brave-browser"):
+        if path := shutil.which(name):
+            return path
+    for path in (
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+    ):
+        if os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def write_pdf(page_html, out_path):
+    """Print an HTML page to a PDF file. Returns an error message, or None on success."""
+    out_path = os.path.abspath(out_path)
+    browser, weasy = find_browser(), shutil.which("weasyprint")
+    if not browser and not weasy:
+        return ("--pdf needs Google Chrome (or Chromium, Edge, Brave; set MDV_CHROME to its path) "
+                "or WeasyPrint (pip install weasyprint)")
+    with tempfile.TemporaryDirectory(prefix="mdv-") as tmp:
+        src = os.path.join(tmp, "doc.html")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write(page_html)
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        if browser:
+            cmd = [browser, "--headless", "--disable-gpu", "--no-pdf-header-footer", "--hide-scrollbars",
+                   "--run-all-compositor-stages-before-draw", "--virtual-time-budget=15000",
+                   "--user-data-dir=" + os.path.join(tmp, "profile"), "--print-to-pdf=" + out_path,
+                   pathlib.Path(src).as_uri()]
+        else:
+            cmd = [weasy, src, out_path]
+        try:
+            run = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return "could not run %s: %s" % (os.path.basename(cmd[0]), e)
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            tail = (run.stderr or run.stdout or "").strip().splitlines()[-3:]
+            return "%s produced no PDF%s" % (os.path.basename(cmd[0]), (": " + " | ".join(tail)) if tail else "")
+    return None
 
 
 # ---------------------------------------------------------------------- main
@@ -1311,11 +1662,24 @@ def main():
     )
     ap.add_argument("-l", "--language", help="show the input as source code in this language (e.g. for stdin)")
     ap.add_argument("--list-themes", action="store_true", help="preview every theme and exit")
+    ap.add_argument("--pdf", action="store_true", help="write a styled PDF instead of printing (needs Chrome or WeasyPrint)")
+    ap.add_argument("-o", "--output", metavar="FILE", help="with --pdf: output file (default: FILE.pdf next to each input)")
+    ap.add_argument("--paper", choices=list(PAPERS), default=os.environ.get("MDV_PAPER", "a4").lower(),
+                    help="with --pdf: paper size (default: $MDV_PAPER or a4)")
     args = ap.parse_args()
     if args.theme not in THEMES and args.theme != "auto":
         ap.error("unknown theme %r (MDV_THEME); choose from: auto, %s" % (args.theme, ", ".join(THEMES)))
     if args.pager not in ("builtin", "less"):
         ap.error("unknown pager %r (MDV_PAGER); choose from: builtin, less" % args.pager)
+
+    if args.pdf and args.list_themes:
+        ap.error("--pdf cannot be combined with --list-themes")
+    if args.output and not args.pdf:
+        ap.error("--output only applies with --pdf")
+    if args.output and len(args.files) > 1:
+        ap.error("--output takes a single input file")
+    if args.pdf and args.paper not in PAPERS:
+        ap.error("unknown paper %r (MDV_PAPER); choose from: %s" % (args.paper, ", ".join(PAPERS)))
 
     tty = sys.stdout.isatty()
     if args.color == "auto":
@@ -1339,6 +1703,26 @@ def main():
         except OSError as e:
             print("mdv: %s: %s" % (path, e.strerror), file=sys.stderr)
             return 1
+
+    if args.pdf:
+        status = 0
+        for path, text in zip(files, texts):
+            if args.output:
+                out_path = args.output
+            elif path == "-":
+                out_path = "mdv.pdf"
+            else:
+                out_path = os.path.splitext(path)[0] + ".pdf"
+            name = "stdin" if path == "-" else os.path.basename(path)
+            base = os.getcwd() if path == "-" else os.path.dirname(os.path.abspath(path))
+            lang = args.language or (os.path.basename(path) if path != "-" and is_source(path) else None)
+            err = write_pdf(html_document(text, name, base, PAPERS[args.paper], lang), out_path)
+            if err:
+                print("mdv: %s: %s" % (path, err), file=sys.stderr)
+                status = 1
+            else:
+                print("mdv: wrote %s" % out_path, file=sys.stderr)
+        return status
 
     def build_first(cols):
         width = args.width or cols
